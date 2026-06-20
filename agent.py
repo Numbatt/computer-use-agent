@@ -326,9 +326,41 @@ def _pick_tool_and_beta(client, w: int, h: int) -> tuple[dict, str]:
 def _save_trajectory(name: str, task: str, steps: list[dict]) -> None:
     TRAJ_DIR.mkdir(exist_ok=True)
     path = TRAJ_DIR / f"{name}.json"
+    existed = path.exists()
     path.write_text(json.dumps({"task": task, "steps": steps}, indent=2))
-    print(f"\n[recorded] {len(steps)} steps (action + screen fingerprint) -> {path}")
+    verb = "overwrote" if existed else "recorded"
+    print(f"\n[{verb}] {len(steps)} steps (action + screen fingerprint) -> {path}")
     print(f"           replay it (deterministic, ~$0) with:  python agent.py --replay {name}")
+
+
+def list_trajectories() -> None:
+    files = sorted(TRAJ_DIR.glob("*.json")) if TRAJ_DIR.exists() else []
+    if not files:
+        print("No memorized trajectories.")
+        return
+    print(f"Memorized trajectories in {TRAJ_DIR}:")
+    for f in files:
+        try:
+            d = json.loads(f.read_text())
+            print(f"  {f.stem:24} {len(d.get('steps', [])):>3} steps  — {d.get('task','')[:56]}")
+        except Exception:
+            print(f"  {f.stem:24} (unreadable)")
+
+
+def forget_trajectory(name: str) -> None:
+    """Delete one memorized trajectory, or all of them with name='all'."""
+    if name == "all":
+        files = list(TRAJ_DIR.glob("*.json")) if TRAJ_DIR.exists() else []
+        for f in files:
+            f.unlink()
+        print(f"Forgot {len(files)} trajectory(ies).")
+        return
+    path = TRAJ_DIR / f"{name}.json"
+    if path.exists():
+        path.unlink()
+        print(f"Forgot '{name}'.")
+    else:
+        print(f"No trajectory named '{name}' (try --list).")
 
 
 # --------------------------------------------------------------------------- #
@@ -429,8 +461,17 @@ def main() -> None:
     p.add_argument("--max-steps", type=int, default=DEFAULT_MAX_STEPS)
     p.add_argument("--threshold", type=float, default=0.12,
                    help="replay: screen-divergence (0..1) above which we fall back to vision")
+    p.add_argument("--list", action="store_true", help="list memorized trajectories")
+    p.add_argument("--forget", metavar="NAME",
+                   help="delete a memorized trajectory (or 'all' to clear them)")
     args = p.parse_args()
 
+    if args.list:
+        list_trajectories()
+        return
+    if args.forget:
+        forget_trajectory(args.forget)
+        return
     if args.replay:
         run_replay(args.replay, threshold=args.threshold)
         return

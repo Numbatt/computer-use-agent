@@ -105,6 +105,18 @@ python agent.py --replay mac_call               # deterministic; vision only if 
 python agent.py --replay mac_call --threshold 0.2   # how different counts as a "surprise"
 ```
 
+## Managing what it's memorized
+
+A "memory" is just a JSON file in `trajectories/` (local only, git-ignored — nothing in
+a database or the cloud). A new vision run with the same `--name` (or same task text)
+**overwrites** that file; a `Ctrl-C`'d run saves nothing.
+
+```bash
+python agent.py --list              # show memorized tasks (name, step count, goal)
+python agent.py --forget mac_call   # delete one
+python agent.py --forget all        # delete all (or: rm trajectories/*.json)
+```
+
 ## Cost
 
 A vision run re-sends every prior screenshot each step (~4,600 tokens/screenshot), so
