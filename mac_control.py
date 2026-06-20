@@ -186,6 +186,22 @@ def cursor_position() -> tuple[int, int]:
     return int(p.x), int(p.y)
 
 
+ABORT_MARGIN = 8  # px; how close to a corner counts as "abort"
+
+
+def check_abort() -> None:
+    """Reliable kill switch: abort if the cursor is near ANY screen corner.
+
+    pyautogui's built-in FAILSAFE only fires at the EXACT corner pixel and only at the
+    start of a pyautogui call. This margin-based check, called before every action we
+    perform, makes "slam the mouse to a corner" actually work."""
+    x, y = cursor_position()
+    w, h = logical_size()
+    corners = [(0, 0), (w - 1, 0), (0, h - 1), (w - 1, h - 1)]
+    if any(abs(x - cx) <= ABORT_MARGIN and abs(y - cy) <= ABORT_MARGIN for cx, cy in corners):
+        raise SystemExit("\n[abort] mouse in a screen corner — stopping immediately.")
+
+
 def wait(seconds: float) -> None:
     time.sleep(min(seconds, 5.0))  # cap so a runaway "wait" can't hang the demo
 

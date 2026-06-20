@@ -108,6 +108,7 @@ SYSTEM_BLOCKS = [{"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type
 def perform(action_input: dict) -> str | None:
     """Run one computer action. Returns a string for actions that report data
     (e.g. cursor_position), else None. Raises on truly unknown actions."""
+    mac.check_abort()  # margin-based corner kill switch, before every action
     a = action_input.get("action")
     coord = action_input.get("coordinate")
 

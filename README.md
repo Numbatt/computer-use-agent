@@ -132,8 +132,10 @@ stub leaves as the obvious next step.)
 
 This program moves your real mouse and types real keystrokes.
 
-- **Kill switch:** slam the mouse into any screen **corner** to abort instantly
-  (pyautogui FAILSAFE).
+- **Kill switch:** **`Ctrl-C` in the terminal** always works. Also: hold the mouse in
+  any screen **corner** — a margin-based check aborts before the next action (more
+  reliable than pyautogui's exact-pixel FAILSAFE, which only fires at the very corner
+  pixel and only at the instant an action starts, not during the model's thinking).
 - **Approval gate:** it stops before sending any invite/email; nothing goes out until
   you approve.
 - **Step cap:** stops after 40 steps so it can't loop forever.
