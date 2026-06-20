@@ -286,6 +286,7 @@ def run_vision(task: str, name: str, max_steps: int) -> None:
     _print_cost(tally)
     print("[cost] (a --replay of this trajectory costs $0 unless it hits a surprise)")
     _save_trajectory(name, task, recorded)
+    mac.notify("CUA loop done.")
 
 
 def _human_continue(messages: list[dict]) -> bool:
@@ -443,9 +444,11 @@ def run_replay(name: str, threshold: float = 0.12, max_fallback_steps: int = 25)
                              max_fallback_steps, None)
         _print_cost(tally)
         print("[replay] vision took over after the surprise and finished. Stopping replay.")
+        mac.notify("CUA loop done (vision fallback).")
         return
 
     print("\n[replay] done — every step matched the recording. Deterministic, $0, no tokens.")
+    mac.notify("CUA loop done (replay).")
 
 
 # --------------------------------------------------------------------------- #

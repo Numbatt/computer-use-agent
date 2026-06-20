@@ -227,6 +227,21 @@ def wait(seconds: float) -> None:
     time.sleep(min(seconds, 5.0))  # cap so a runaway "wait" can't hang the demo
 
 
+def notify(message: str, title: str = "computer-use-agent") -> None:
+    """Post a macOS banner notification. Best-effort — needs the terminal app to have
+    Notifications allowed (System Settings -> Notifications); silently no-ops otherwise."""
+    msg = message.replace('"', "'")
+    ttl = title.replace('"', "'")
+    try:
+        subprocess.run(
+            ["osascript", "-e",
+             f'display notification "{msg}" with title "{ttl}" sound name "Glass"'],
+            capture_output=True,
+        )
+    except Exception:
+        pass
+
+
 if __name__ == "__main__":
     # Quick self-test: capture a screenshot and report sizes. No clicks (safe to run).
     b64, w, h = screenshot()
