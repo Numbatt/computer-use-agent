@@ -77,21 +77,43 @@ python mac_control.py   # should print your screen's logical size
 
 ## Run
 
+**Dry run first** (one model call, prints the first action it *would* take, clicks nothing):
+
+```bash
+python agent.py "Schedule a 15-min 'catch up' with Mac Ajwani Sun Jun 21 3:30pm" --dry-run
+```
+
 **Vision mode** (Claude drives, and the run is recorded):
 
 ```bash
-python agent.py "Schedule a 30-min Coffee with Mac Ajwani tomorrow at 3pm" --name coffee_mac
+python agent.py "Schedule a 15-min 'catch up' with Mac Ajwani Sun Jun 21 3:30pm" --name mac_call
 ```
 
-It opens Calendar, creates the event, types the name, reads the autocomplete to
-resolve the email, and then **stops before sending** with a `READY TO SEND:` summary.
-Press Enter to finish, or type `approved — send the invite` to let it send.
+It opens your browser to **Google Calendar** (`calendar.google.com`), creates the
+event, types the person's name, reads Google's autocomplete to **resolve their email**,
+and then **stops before saving** with a `READY TO SEND:` summary. Press Enter to finish,
+or type `approved — send the invite` to let it save and send.
 
 **Replay mode** (the Cyberdesk stub — deterministic, **no model calls, ~zero cost**):
 
 ```bash
 python agent.py --replay coffee_mac
 ```
+
+## Cost
+
+A vision run re-sends every prior screenshot each step (~4,600 tokens/screenshot), so
+input grows each turn. At Opus 4.8 pricing it adds up fast — which is the whole point
+of replay. The agent prints a live `[usage]` line per step and a `[cost]` total.
+
+| | per run |
+|---|---|
+| Vision run, **no caching** | ~$2–5 |
+| Vision run, **with prompt caching** (on — prior screenshots re-read at ~0.1×) | ~$0.50–0.80 |
+| `--replay` (no model calls at all) | **$0.00** |
+
+Caching is built in (a cached system block + a moving cache breakpoint on the latest
+screenshot). Billed to your Anthropic API account — see console.anthropic.com → Usage.
 
 ## Why the "replay" mode mirrors Cyberdesk
 

@@ -70,36 +70,36 @@ You are operating Diego's personal Mac by looking at screenshots and issuing mou
 and keyboard actions. You are careful, take one deliberate action at a time, and
 re-check the screen after each step.
 
-To schedule a meeting with a person:
-1. Open Calendar with Spotlight: press cmd+space, type "Calendar", press Return. If
-   cmd+space does nothing (the terminal may swallow it), click the Spotlight icon in
-   the top-right menu bar instead.
-2. Create the event with cmd+N, then use the "Create Quick Event" field. Type ONE
-   natural-language string that includes the title, date, AND both the start and end
-   time — e.g. "catch up June 21 2026 from 3:30pm to 3:45pm". Including the END time
-   here sets the duration correctly in a single step. Press Return.
-   - CRITICAL: do NOT set the duration by editing the end-time stepper widget digit by
-     digit — that widget fights you (typing an hour re-selects the field). If the
-     duration is ever wrong, fix it by re-doing the Quick Event with an explicit
-     "to <end time>", not by nudging the stepper. If you truly must edit a time field,
-     select the WHOLE field and type the full value like "3:45 PM" at once, then Tab.
-3. Add the person as an invitee. IMPORTANT: you usually will NOT be told their email.
-   Type their NAME into the invitee/"Add Invitees" field, then look at the autocomplete
-   dropdown that appears and pick the entry whose email most plausibly belongs to that
-   person. If several appear, choose the best match and say why. If NO plausible match
-   appears, stop and report that you could not resolve the email — do not guess an address.
+Schedule the meeting in GOOGLE CALENDAR via the web — NOT the macOS Calendar app:
+1. Open the default web browser via Spotlight (press cmd+space, type "Safari" or
+   "Chrome" — whichever is installed — press Return). If cmd+space does nothing (the
+   terminal may swallow it), click the Spotlight icon in the top-right menu bar.
+2. Go to Google Calendar: focus the address bar with cmd+L, type "calendar.google.com",
+   press Return. Wait for it to load (the user is already logged in).
+3. Create an event: click the "Create" button (top-left), then choose "Event". If a
+   small quick popover appears, click "More options" to open the full editor.
+4. Set the title, the date, and BOTH the start and end time so the duration is exactly
+   as requested (e.g. 3:30 PM to 3:45 PM = 15 minutes). When a time dropdown appears,
+   click the matching option, or select the whole field and type the full value like
+   "3:45 PM" at once — never nudge a time one digit at a time.
+5. Add the person: click "Add guests", type their NAME, and pick the entry from
+   Google's autocomplete whose email most plausibly belongs to that person. If several
+   appear, choose the best and say why. If NONE appears, stop and report — do not guess.
 
-CRITICAL — do not send anything without approval. When the event is fully composed and
-the invitee's email is resolved, DO NOT click Send/Add/Done that would dispatch the
-invite. Instead, stop and end your turn with a line beginning exactly:
+CRITICAL — do not send. Once the event is fully composed and the guest's email is
+resolved, DO NOT click "Save" (saving an event that has a guest sends the invite).
+Instead stop and end your turn with a line beginning exactly:
   READY TO SEND:
-followed by a one-line summary (event title, time, and the resolved invitee email).
+followed by a one-line summary (title, date, time, and the resolved guest email).
 A human will review and approve.
 
 General rules: never open or read unrelated apps, messages, or files. If something
 unexpected blocks you (a dialog, a login), describe it and stop rather than clicking
 blindly.
 """
+
+# Cached form of the system prompt — the stable, identical-every-turn prefix.
+SYSTEM_BLOCKS = [{"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}]
 
 
 # --------------------------------------------------------------------------- #
@@ -173,6 +173,23 @@ def text_of(content_blocks) -> str:
     return "".join(b.text for b in content_blocks if getattr(b, "type", None) == "text").strip()
 
 
+def _mark_cache(messages: list[dict]) -> None:
+    """Move a single cache breakpoint to the most recent user turn. Combined with the
+    cached system block, this makes every re-sent screenshot from prior turns bill at
+    ~0.1x instead of full price — the dominant cost in a computer-use loop."""
+    for m in messages:  # clear stale breakpoints first (max 4 allowed per request)
+        if m["role"] == "user" and isinstance(m.get("content"), list):
+            for blk in m["content"]:
+                if isinstance(blk, dict):
+                    blk.pop("cache_control", None)
+    for m in reversed(messages):  # set one on the last user message's last block
+        if m["role"] == "user" and isinstance(m.get("content"), list) and m["content"]:
+            last = m["content"][-1]
+            if isinstance(last, dict):
+                last["cache_control"] = {"type": "ephemeral"}
+            break
+
+
 # --------------------------------------------------------------------------- #
 # VISION mode — Claude drives; we record the actions.
 # --------------------------------------------------------------------------- #
@@ -195,12 +212,22 @@ def run_vision(task: str, name: str, max_steps: int) -> None:
     recorded: list[dict] = []
 
     step = 0
+    tally = {"in": 0, "cache_read": 0, "cache_write": 0, "out": 0}
     while True:
+        _mark_cache(messages)
         resp = client.beta.messages.create(
-            model=MODEL, max_tokens=MAX_TOKENS, system=SYSTEM_PROMPT,
+            model=MODEL, max_tokens=MAX_TOKENS, system=SYSTEM_BLOCKS,
             tools=[tool], betas=[beta], messages=messages,
         )
         messages.append({"role": "assistant", "content": resp.content})
+
+        u = resp.usage
+        tally["in"] += u.input_tokens
+        tally["cache_read"] += (u.cache_read_input_tokens or 0)
+        tally["cache_write"] += (u.cache_creation_input_tokens or 0)
+        tally["out"] += u.output_tokens
+        print(f"[usage] in={u.input_tokens} cache_read={u.cache_read_input_tokens or 0} "
+              f"cache_write={u.cache_creation_input_tokens or 0} out={u.output_tokens}")
 
         say = text_of(resp.content)
         if say:
@@ -240,6 +267,12 @@ def run_vision(task: str, name: str, max_steps: int) -> None:
             print(f"\n[stop] hit the {max_steps}-step cap. Ending for safety.")
             break
 
+    # Opus 4.8: $5/M input, $0.50/M cached read, $6.25/M cached write, $25/M output.
+    cost = (tally["in"] * 5 + tally["cache_read"] * 0.5
+            + tally["cache_write"] * 6.25 + tally["out"] * 25) / 1e6
+    print(f"\n[cost] tokens {tally}")
+    print(f"[cost] ~${cost:.3f} this run "
+          f"(cached reads at ~0.1x; a --replay of this run costs $0)")
     _save_trajectory(name, task, recorded)
 
 
