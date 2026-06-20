@@ -31,18 +31,39 @@ import sys
 import time
 from pathlib import Path
 
+import os
+
 import anthropic
 
 import mac_control as mac
+
+
+def _load_dotenv() -> None:
+    """Load KEY=VALUE lines from a local .env (next to this file) into os.environ,
+    without overriding anything already set. No dependency, so `pip install` stays tiny."""
+    env_path = Path(__file__).parent / ".env"
+    if not env_path.exists():
+        return
+    for line in env_path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        os.environ.setdefault(key.strip(), val.strip().strip('"').strip("'"))
+
 
 MODEL = "claude-opus-4-8"
 MAX_TOKENS = 4096
 DEFAULT_MAX_STEPS = 40
 TRAJ_DIR = Path(__file__).parent / "trajectories"
 
-# Anthropic gates computer use behind a beta header. The exact string has changed
-# across model generations, so we try the known ones in order and cache the winner.
-BETA_CANDIDATES = ["computer-use-2025-01-24", "computer-use-2025-11-24"]
+# Computer use is gated behind a beta header AND the tool TYPE is version-pinned to
+# the model generation — they must match. Newer models (Opus 4.5/4.8) use the
+# 20251124 pair; older ones use 20250124. We try newest first and cache the winner.
+TOOL_BETA_CANDIDATES = [
+    ("computer_20251124", "computer-use-2025-11-24"),
+    ("computer_20250124", "computer-use-2025-01-24"),
+]
 
 SYSTEM_PROMPT = """\
 You are operating Diego's personal Mac by looking at screenshots and issuing mouse
@@ -148,11 +169,9 @@ def text_of(content_blocks) -> str:
 def run_vision(task: str, name: str, max_steps: int) -> None:
     client = anthropic.Anthropic()
     w, h = mac.logical_size()
-    tool = {"type": "computer_20250124", "name": "computer",
-            "display_width_px": w, "display_height_px": h}
-
     print(f"[setup] logical screen {w}x{h}; model {MODEL}")
     print(f"[setup] task: {task}\n")
+    tool, beta = _pick_tool_and_beta(client, w, h)
 
     b64, _, _ = mac.screenshot()
     messages: list[dict] = [{
@@ -164,7 +183,6 @@ def run_vision(task: str, name: str, max_steps: int) -> None:
     }]
 
     recorded: list[dict] = []
-    beta = _pick_beta(client, tool, messages)
 
     step = 0
     while True:
@@ -230,22 +248,24 @@ def _human_continue(messages: list[dict]) -> bool:
     return True
 
 
-def _pick_beta(client, tool, messages) -> str:
-    """Find a computer-use beta header this model accepts (cheap probe via a tiny call)."""
+def _pick_tool_and_beta(client, w: int, h: int) -> tuple[dict, str]:
+    """Find the (tool type, beta header) pair this model accepts. Cheap probe call."""
     last_err = None
-    for beta in BETA_CANDIDATES:
+    for tool_type, beta in TOOL_BETA_CANDIDATES:
+        tool = {"type": tool_type, "name": "computer",
+                "display_width_px": w, "display_height_px": h}
         try:
             client.beta.messages.create(
                 model=MODEL, max_tokens=16, system=SYSTEM_PROMPT,
                 tools=[tool], betas=[beta],
                 messages=[{"role": "user", "content": "Reply with the single word: ready"}],
             )
-            print(f"[setup] using beta header: {beta}")
-            return beta
+            print(f"[setup] using tool={tool_type}, beta={beta}")
+            return tool, beta
         except anthropic.BadRequestError as e:
             last_err = e
             continue
-    raise SystemExit(f"No computer-use beta header accepted by {MODEL}. Last error:\n{last_err}")
+    raise SystemExit(f"No computer-use tool/beta accepted by {MODEL}. Last error:\n{last_err}")
 
 
 def _save_trajectory(name: str, task: str, actions: list[dict]) -> None:
@@ -254,6 +274,38 @@ def _save_trajectory(name: str, task: str, actions: list[dict]) -> None:
     path.write_text(json.dumps({"task": task, "actions": actions}, indent=2))
     print(f"\n[recorded] {len(actions)} actions -> {path}")
     print(f"           replay deterministically with:  python agent.py --replay {name}")
+
+
+# --------------------------------------------------------------------------- #
+# DRY-RUN — one model call, prints the first action it WOULD take. No clicks.
+# Safe end-to-end check of: API key, beta header, screenshot encoding, grounding.
+# --------------------------------------------------------------------------- #
+def run_dryrun(task: str) -> None:
+    client = anthropic.Anthropic()
+    w, h = mac.logical_size()
+    tool, beta = _pick_tool_and_beta(client, w, h)
+    b64, _, _ = mac.screenshot()
+    messages = [{"role": "user", "content": [
+        {"type": "text", "text": task},
+        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": b64}},
+    ]}]
+    resp = client.beta.messages.create(
+        model=MODEL, max_tokens=MAX_TOKENS, system=SYSTEM_PROMPT,
+        tools=[tool], betas=[beta], messages=messages,
+    )
+    u = resp.usage
+    print(f"\n[dry-run] stop_reason={resp.stop_reason}")
+    print(f"[dry-run] usage: input={u.input_tokens} output={u.output_tokens} "
+          f"(one screenshot + system + task in this call)")
+    say = text_of(resp.content)
+    if say:
+        print(f"[claude] {say}")
+    actions = [b.input for b in resp.content if getattr(b, "type", None) == "tool_use"]
+    if actions:
+        print(f"[dry-run] first action it WOULD take: {describe(actions[0])}")
+        print("[dry-run] (nothing was executed — pipeline verified end to end ✅)")
+    else:
+        print("[dry-run] no action proposed; Claude responded with text only.")
 
 
 # --------------------------------------------------------------------------- #
@@ -278,15 +330,23 @@ def run_replay(name: str) -> None:
 
 # --------------------------------------------------------------------------- #
 def main() -> None:
+    _load_dotenv()
     p = argparse.ArgumentParser(description="A Mac computer-use agent (vision + replay).")
     p.add_argument("task", nargs="?", help="natural-language task for vision mode")
     p.add_argument("--replay", metavar="NAME", help="replay a recorded trajectory, no LLM")
+    p.add_argument("--dry-run", action="store_true",
+                   help="one model call; print the first action it WOULD take, execute nothing")
     p.add_argument("--name", help="name for the recorded trajectory (default: slug of task)")
     p.add_argument("--max-steps", type=int, default=DEFAULT_MAX_STEPS)
     args = p.parse_args()
 
     if args.replay:
         run_replay(args.replay)
+        return
+    if args.dry_run:
+        if not args.task:
+            p.error("--dry-run needs a task")
+        run_dryrun(args.task)
         return
     if not args.task:
         p.error("provide a task, or use --replay NAME")
