@@ -186,6 +186,27 @@ def cursor_position() -> tuple[int, int]:
     return int(p.x), int(p.y)
 
 
+def screen_thumb(w: int = 80, h: int = 50) -> bytes:
+    """A tiny grayscale thumbnail of the current screen — a cheap 'fingerprint' of state.
+    Used by replay to detect when the screen diverged from what was recorded."""
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+        tmp_path = tmp.name
+    try:
+        subprocess.run(["screencapture", "-x", "-t", "png", tmp_path],
+                       capture_output=True, check=True)
+        img = Image.open(tmp_path).convert("L").resize((w, h), Image.LANCZOS)
+        return img.tobytes()
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+
+
+def thumb_diff(a: bytes, b: bytes) -> float:
+    """Normalized mean absolute difference (0.0 identical .. 1.0 maximally different)."""
+    if len(a) != len(b) or not a:
+        return 1.0
+    return sum(abs(x - y) for x, y in zip(a, b)) / (255.0 * len(a))
+
+
 ABORT_MARGIN = 8  # px; how close to a corner counts as "abort"
 
 

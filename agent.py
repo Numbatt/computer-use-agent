@@ -8,30 +8,35 @@ This is the loop that makes a computer-use agent a computer-use agent:
 Claude never touches the machine. It only looks at screenshots (via Anthropic's
 `computer` tool) and replies with structured actions; mac_control.py performs them.
 
+The system prompt is GENERIC — it gives operating principles, not task steps. Claude
+figures out *how* to do whatever goal you give it, live.
+
 Two modes:
-  * VISION mode (default): Claude drives, and we LOG every action it takes to
-    trajectories/<name>.json.
-  * REPLAY mode (--replay <name>): we replay that logged action sequence with NO
-    model calls at all — the deterministic, ~free, fast path. This is a tiny
-    version of Cyberdesk's "memorize the steps, replay deterministically, fall
-    back to the vision model only on surprises" idea.
+  * VISION mode (default): Claude drives toward the goal, and we LOG each action plus a
+    small screen 'fingerprint' (thumbnail) to trajectories/<name>.json.
+  * REPLAY mode (--replay <name>): replay those actions with NO model calls — BUT before
+    each one, check the screen still matches the recorded fingerprint. If it matches,
+    execute deterministically (~$0). If it diverges ("surprise"), fall back to live
+    vision to finish. This is Cyberdesk's "memorize steps, replay deterministically,
+    fall back to the vision model on surprises" pattern, in miniature.
 
 Usage:
-    python agent.py "Schedule a 30-min Coffee with Mac Ajwani tomorrow at 3pm"
-    python agent.py "..." --name coffee_mac          # name the recorded trajectory
-    python agent.py --replay coffee_mac              # deterministic replay, no LLM
+    python agent.py "Open TextEdit and write me a haiku about Houston"
+    python agent.py "..." --name my_task          # name the recorded trajectory
+    python agent.py --replay my_task              # verified replay; vision on surprise
+    python agent.py "..." --dry-run               # 1 call, prints first action, no clicks
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
 import json
+import os
 import re
 import sys
 import time
 from pathlib import Path
-
-import os
 
 import anthropic
 
@@ -66,36 +71,28 @@ TOOL_BETA_CANDIDATES = [
 ]
 
 SYSTEM_PROMPT = """\
-You are operating Diego's personal Mac by looking at screenshots and issuing mouse
-and keyboard actions. You are careful, take one deliberate action at a time, and
-re-check the screen after each step.
+You operate the user's Mac by looking at screenshots and issuing mouse/keyboard actions
+to accomplish the user's goal. You figure out HOW yourself — no one hands you steps.
 
-Schedule the meeting in GOOGLE CALENDAR via the web — NOT the macOS Calendar app:
-1. Open the default web browser via Spotlight (press cmd+space, type "Safari" or
-   "Chrome" — whichever is installed — press Return). If cmd+space does nothing (the
-   terminal may swallow it), click the Spotlight icon in the top-right menu bar.
-2. Go to Google Calendar: focus the address bar with cmd+L, type "calendar.google.com",
-   press Return. Wait for it to load (the user is already logged in).
-3. Create an event: click the "Create" button (top-left), then choose "Event". If a
-   small quick popover appears, click "More options" to open the full editor.
-4. Set the title, the date, and BOTH the start and end time so the duration is exactly
-   as requested (e.g. 3:30 PM to 3:45 PM = 15 minutes). When a time dropdown appears,
-   click the matching option, or select the whole field and type the full value like
-   "3:45 PM" at once — never nudge a time one digit at a time.
-5. Add the person: click "Add guests", type their NAME, and pick the entry from
-   Google's autocomplete whose email most plausibly belongs to that person. If several
-   appear, choose the best and say why. If NONE appears, stop and report — do not guess.
+Operating principles:
+- Take ONE action at a time, and re-check the screen after each before deciding the next.
+- Open apps with Spotlight: press cmd+space, type the app name, press Return. If
+  cmd+space seems to do nothing, click the Spotlight icon in the top-right menu bar.
+- Prefer keyboard shortcuts and typed input over hunting for tiny targets when practical.
+  To set a value in a field, select the whole field and type the full value at once;
+  don't nudge steppers one digit at a time (they fight you).
+- When a field has autocomplete (emails, contacts, search, addresses), type enough of
+  the NAME to disambiguate, then read the dropdown and pick the entry that best matches.
+  Say why you picked it. If nothing plausible appears, stop and report — never guess.
+- If something unexpected blocks you (a dialog, a login, a permission prompt), describe
+  what you see and stop rather than clicking blindly.
 
-CRITICAL — do not send. Once the event is fully composed and the guest's email is
-resolved, DO NOT click "Save" (saving an event that has a guest sends the invite).
-Instead stop and end your turn with a line beginning exactly:
+SAFETY — never take an irreversible or outward-facing action without approval. That
+includes sending an email / message / calendar invite, submitting a form, deleting, or
+purchasing. When everything is composed and you are about to do such an action, DO NOT
+do it. Instead stop and end your turn with a line beginning exactly:
   READY TO SEND:
-followed by a one-line summary (title, date, time, and the resolved guest email).
-A human will review and approve.
-
-General rules: never open or read unrelated apps, messages, or files. If something
-unexpected blocks you (a dialog, a login), describe it and stop rather than clicking
-blindly.
+followed by a one-line summary of exactly what you are about to do. A human will approve.
 """
 
 # Cached form of the system prompt — the stable, identical-every-turn prefix.
@@ -192,28 +189,29 @@ def _mark_cache(messages: list[dict]) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# VISION mode — Claude drives; we record the actions.
+# Shared helpers for vision mode and the replay-with-fallback path.
 # --------------------------------------------------------------------------- #
-def run_vision(task: str, name: str, max_steps: int) -> None:
-    client = anthropic.Anthropic()
-    w, h = mac.logical_size()
-    print(f"[setup] logical screen {w}x{h}; model {MODEL}")
-    print(f"[setup] task: {task}\n")
-    tool, beta = _pick_tool_and_beta(client, w, h)
+def _seed_messages(task: str, screenshot_b64: str) -> list[dict]:
+    return [{"role": "user", "content": [
+        {"type": "text", "text": task},
+        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": screenshot_b64}},
+    ]}]
 
-    b64, _, _ = mac.screenshot()
-    messages: list[dict] = [{
-        "role": "user",
-        "content": [
-            {"type": "text", "text": task},
-            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": b64}},
-        ],
-    }]
 
-    recorded: list[dict] = []
+def _print_cost(tally: dict) -> None:
+    # Opus 4.8: $5/M input, $0.50/M cached read, $6.25/M cached write, $25/M output.
+    cost = (tally["in"] * 5 + tally["cache_read"] * 0.5
+            + tally["cache_write"] * 6.25 + tally["out"] * 25) / 1e6
+    print(f"\n[cost] tokens {tally}")
+    print(f"[cost] ~${cost:.3f} for this vision segment (cached reads at ~0.1x)")
 
-    step = 0
+
+def _vision_loop(client, tool, beta, messages, max_steps, recorded) -> dict:
+    """The core perception->decision->action loop. If `recorded` is a list, append a
+    {action, thumb} entry per executed action — the screen 'fingerprint' BEFORE the
+    action ran, so replay can later tell whether the world still matches."""
     tally = {"in": 0, "cache_read": 0, "cache_write": 0, "out": 0}
+    step = 0
     while True:
         _mark_cache(messages)
         resp = client.beta.messages.create(
@@ -236,10 +234,8 @@ def run_vision(task: str, name: str, max_steps: int) -> None:
 
         if resp.stop_reason == "pause_turn":
             continue  # server-side loop paused; just re-send to resume
-
         if resp.stop_reason != "tool_use":
-            # Claude is done with this turn. Hand control to the human (the approval beat).
-            if _human_continue(messages):
+            if _human_continue(messages):  # approval beat / human steering
                 continue
             break
 
@@ -249,8 +245,11 @@ def run_vision(task: str, name: str, max_steps: int) -> None:
                 continue
             action_input = block.input
             print(f"  -> {describe(action_input)}")
+            thumb = mac.screen_thumb() if recorded is not None else None
             reported = perform(action_input)
-            recorded.append(action_input)
+            if recorded is not None:
+                recorded.append({"action": action_input,
+                                 "thumb": base64.b64encode(thumb).decode("ascii")})
             time.sleep(0.4)  # let the UI settle before we look again
 
             if reported is not None and action_input.get("action") == "cursor_position":
@@ -267,13 +266,25 @@ def run_vision(task: str, name: str, max_steps: int) -> None:
         if step >= max_steps:
             print(f"\n[stop] hit the {max_steps}-step cap. Ending for safety.")
             break
+    return tally
 
-    # Opus 4.8: $5/M input, $0.50/M cached read, $6.25/M cached write, $25/M output.
-    cost = (tally["in"] * 5 + tally["cache_read"] * 0.5
-            + tally["cache_write"] * 6.25 + tally["out"] * 25) / 1e6
-    print(f"\n[cost] tokens {tally}")
-    print(f"[cost] ~${cost:.3f} this run "
-          f"(cached reads at ~0.1x; a --replay of this run costs $0)")
+
+# --------------------------------------------------------------------------- #
+# VISION mode — Claude figures the task out live (generic prompt); we record it.
+# --------------------------------------------------------------------------- #
+def run_vision(task: str, name: str, max_steps: int) -> None:
+    client = anthropic.Anthropic()
+    w, h = mac.logical_size()
+    print(f"[setup] logical screen {w}x{h}; model {MODEL}")
+    print(f"[setup] goal: {task}\n")
+    tool, beta = _pick_tool_and_beta(client, w, h)
+
+    b64, _, _ = mac.screenshot()
+    messages = _seed_messages(task, b64)
+    recorded: list[dict] = []
+    tally = _vision_loop(client, tool, beta, messages, max_steps, recorded)
+    _print_cost(tally)
+    print("[cost] (a --replay of this trajectory costs $0 unless it hits a surprise)")
     _save_trajectory(name, task, recorded)
 
 
@@ -312,12 +323,12 @@ def _pick_tool_and_beta(client, w: int, h: int) -> tuple[dict, str]:
     raise SystemExit(f"No computer-use tool/beta accepted by {MODEL}. Last error:\n{last_err}")
 
 
-def _save_trajectory(name: str, task: str, actions: list[dict]) -> None:
+def _save_trajectory(name: str, task: str, steps: list[dict]) -> None:
     TRAJ_DIR.mkdir(exist_ok=True)
     path = TRAJ_DIR / f"{name}.json"
-    path.write_text(json.dumps({"task": task, "actions": actions}, indent=2))
-    print(f"\n[recorded] {len(actions)} actions -> {path}")
-    print(f"           replay deterministically with:  python agent.py --replay {name}")
+    path.write_text(json.dumps({"task": task, "steps": steps}, indent=2))
+    print(f"\n[recorded] {len(steps)} steps (action + screen fingerprint) -> {path}")
+    print(f"           replay it (deterministic, ~$0) with:  python agent.py --replay {name}")
 
 
 # --------------------------------------------------------------------------- #
@@ -353,23 +364,56 @@ def run_dryrun(task: str) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# REPLAY mode — the Cyberdesk stub: run the recorded actions with NO model calls.
+# REPLAY mode — the Cyberdesk pattern in miniature: replay recorded steps with NO
+# model calls, but verify the screen still matches before each one, and fall back
+# to live vision the moment it diverges ("surprise").
 # --------------------------------------------------------------------------- #
-def run_replay(name: str) -> None:
+def run_replay(name: str, threshold: float = 0.12, max_fallback_steps: int = 25) -> None:
     path = TRAJ_DIR / f"{name}.json"
     if not path.exists():
         raise SystemExit(f"No trajectory named {name!r} at {path}")
     data = json.loads(path.read_text())
-    actions = data["actions"]
-    print(f"[replay] {name}: {len(actions)} recorded actions, ZERO model calls.")
-    print(f"[replay] task was: {data['task']}")
-    print("[replay] starting in 3s — move mouse to a corner to abort.\n")
+    steps = data.get("steps", [])
+    goal = data.get("task", "")
+    if not steps or "thumb" not in steps[0]:
+        raise SystemExit(f"Trajectory {name!r} has no screen fingerprints — re-record it "
+                         f"with this version before replaying.")
+    print(f"[replay] {name}: {len(steps)} recorded steps.")
+    print(f"[replay] Replaying deterministically (no model calls); falls back to live")
+    print(f"[replay] vision if the screen diverges by more than {threshold:.2f}.")
+    print(f"[replay] goal was: {goal}")
+    print("[replay] starting in 3s — Ctrl-C or a screen corner aborts.\n")
     time.sleep(3)
-    for i, action_input in enumerate(actions, 1):
-        print(f"  [{i}/{len(actions)}] {describe(action_input)}")
-        perform(action_input)
-        time.sleep(0.5)
-    print("\n[replay] done — deterministic, no screenshots sent, no tokens spent.")
+
+    client = tool = beta = None
+    for i, step in enumerate(steps, 1):
+        action = step["action"]
+        expected = base64.b64decode(step["thumb"])
+        diff = mac.thumb_diff(expected, mac.screen_thumb())
+        if diff <= threshold:
+            print(f"  [{i}/{len(steps)}] diff={diff:.3f} ok    {describe(action)}")
+            perform(action)
+            time.sleep(0.5)
+            continue
+
+        # --- SURPRISE: screen isn't what we recorded. Hand off to live vision. ---
+        print(f"  [{i}/{len(steps)}] diff={diff:.3f} > {threshold:.2f}  *** SURPRISE ***")
+        print("[replay] screen diverged from the recording — falling back to live vision.")
+        if client is None:
+            client = anthropic.Anthropic()
+            w, h = mac.logical_size()
+            tool, beta = _pick_tool_and_beta(client, w, h)
+        b64, _, _ = mac.screenshot()
+        recovery = (f"{goal}\n\n(You are partway through this task but the screen is not in "
+                    f"the expected state. Look at the current screen and continue from here "
+                    f"to finish the goal.)")
+        tally = _vision_loop(client, tool, beta, _seed_messages(recovery, b64),
+                             max_fallback_steps, None)
+        _print_cost(tally)
+        print("[replay] vision took over after the surprise and finished. Stopping replay.")
+        return
+
+    print("\n[replay] done — every step matched the recording. Deterministic, $0, no tokens.")
 
 
 # --------------------------------------------------------------------------- #
@@ -377,15 +421,18 @@ def main() -> None:
     _load_dotenv()
     p = argparse.ArgumentParser(description="A Mac computer-use agent (vision + replay).")
     p.add_argument("task", nargs="?", help="natural-language task for vision mode")
-    p.add_argument("--replay", metavar="NAME", help="replay a recorded trajectory, no LLM")
+    p.add_argument("--replay", metavar="NAME",
+                   help="replay a recorded trajectory; falls back to vision on a surprise")
     p.add_argument("--dry-run", action="store_true",
                    help="one model call; print the first action it WOULD take, execute nothing")
     p.add_argument("--name", help="name for the recorded trajectory (default: slug of task)")
     p.add_argument("--max-steps", type=int, default=DEFAULT_MAX_STEPS)
+    p.add_argument("--threshold", type=float, default=0.12,
+                   help="replay: screen-divergence (0..1) above which we fall back to vision")
     args = p.parse_args()
 
     if args.replay:
-        run_replay(args.replay)
+        run_replay(args.replay, threshold=args.threshold)
         return
     if args.dry_run:
         if not args.task:

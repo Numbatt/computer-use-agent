@@ -6,3 +6,4 @@ __pycache__/
 /tmp_screens/
 *.png
 !docs/*.png
+trajectories/*.json

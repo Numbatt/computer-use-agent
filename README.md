@@ -1,13 +1,14 @@
 # computer-use-agent
 
-A tiny **computer-use agent for macOS**: tell it a task in plain English and it
+A tiny **computer-use agent for macOS**: tell it any task in plain English and it
 operates your Mac — looking at the screen and moving the mouse/keyboard — to do it.
-The v0 task is *"schedule a meeting with someone,"* and the showpiece is that it
-**figures out the person's email itself** by typing their name and reading the
-autocomplete dropdown, instead of being handed the address.
+The system prompt is **generic** (operating principles, not task steps), so the agent
+**figures out *how* to do whatever you ask, live**: open an app, schedule a meeting and
+resolve a guest's email from autocomplete, search the web, write a note, etc.
 
-It also includes a small **record-and-replay** mode (see below), a miniature of the
-hybrid approach Cyberdesk uses.
+It also includes a **learn-then-replay** mode: record a task once, then replay it
+deterministically for ~$0 — falling back to live vision the moment the screen diverges.
+That's the hybrid pattern Cyberdesk uses, in miniature (see below).
 
 > Built as a learning project. The interesting part isn't the lines of code — it's
 > the mental model below.
@@ -53,8 +54,8 @@ The loop, which is the whole thing:
 | File | Role |
 |---|---|
 | `mac_control.py` | **the hands** — Retina-aware screenshots + mouse/keyboard |
-| `agent.py` | **the brain wiring** — the Claude `computer`-tool loop + record/replay |
-| `trajectories/` | recorded action sequences for `--replay` |
+| `agent.py` | **the brain wiring** — generic Claude `computer`-tool loop + learn/replay |
+| `trajectories/` | recorded action + screen-fingerprint sequences for `--replay` |
 
 ## Setup
 
@@ -80,24 +81,28 @@ python mac_control.py   # should print your screen's logical size
 **Dry run first** (one model call, prints the first action it *would* take, clicks nothing):
 
 ```bash
-python agent.py "Schedule a 15-min 'catch up' with Mac Ajwani Sun Jun 21 3:30pm" --dry-run
+python agent.py "Open TextEdit and write a haiku about Houston" --dry-run
 ```
 
-**Vision mode** (Claude drives, and the run is recorded):
+**Vision mode** (Claude figures the task out live, and the run is recorded). The prompt
+is generic, so any of these work:
 
 ```bash
-python agent.py "Schedule a 15-min 'catch up' with Mac Ajwani Sun Jun 21 3:30pm" --name mac_call
+python agent.py "Open TextEdit and write a haiku about Houston" --name haiku
+python agent.py "Schedule a 15-min 'catch up' with Mac Ajwani in Google Calendar Sun Jun 21 3:30-3:45pm" --name mac_call
 ```
 
-It opens your browser to **Google Calendar** (`calendar.google.com`), creates the
-event, types the person's name, reads Google's autocomplete to **resolve their email**,
-and then **stops before saving** with a `READY TO SEND:` summary. Press Enter to finish,
-or type `approved — send the invite` to let it save and send.
+For an outward-facing action (sending an invite/email, submitting a form), the agent
+**composes everything then stops** with a `READY TO SEND:` summary — press Enter to
+finish, or type `approved — send it` to let it go. For the meeting task, the showpiece
+is that it **resolves the guest's email itself** from the autocomplete dropdown.
 
-**Replay mode** (the Cyberdesk stub — deterministic, **no model calls, ~zero cost**):
+**Replay mode** — replay the recorded run, **$0 and no model calls**, *but* it checks the
+screen still matches before each step and **falls back to live vision on a surprise**:
 
 ```bash
-python agent.py --replay coffee_mac
+python agent.py --replay mac_call               # deterministic; vision only if needed
+python agent.py --replay mac_call --threshold 0.2   # how different counts as a "surprise"
 ```
 
 ## Cost
@@ -110,7 +115,7 @@ of replay. The agent prints a live `[usage]` line per step and a `[cost]` total.
 |---|---|
 | Vision run, **no caching** | ~$2–5 |
 | Vision run, **with prompt caching** (on — prior screenshots re-read at ~0.1×) | ~$0.50–0.80 |
-| `--replay` (no model calls at all) | **$0.00** |
+| `--replay` (deterministic; vision only if the screen diverges) | **$0** (until a surprise) |
 
 Caching is built in (a cached system block + a moving cache breakpoint on the latest
 screenshot). Billed to your Anthropic API account — see console.anthropic.com → Usage.
@@ -122,11 +127,22 @@ reliably, only falling back to computer use models during expected popups,"* so
 repeated tasks run *"100% deterministically, upwards of 3x faster, and almost zero
 cost."* In their words: *vision is the fallback, not the hot path.*
 
-`--replay` is a miniature of that: vision mode records the exact action sequence once;
-replay re-executes it with no screenshots and no LLM calls. (A production version
-would add a cheap per-step check that the screen looks as expected and fall back to a
-live vision step on a surprise — that "fall back on surprise" piece is the part this
-stub leaves as the obvious next step.)
+`--replay` implements that loop in miniature:
+
+1. **Learn once.** Vision mode records each action *plus a small grayscale thumbnail of
+   the screen right before it* — a cheap "fingerprint" of the expected state.
+2. **Replay deterministically.** On replay, before each step it screenshots and compares
+   to the recorded fingerprint. If they match (within `--threshold`), it executes the
+   recorded action with **no model call** — fast and free.
+3. **Fall back on surprise.** If the screen has diverged (a popup, a moved window, a
+   different autocomplete list), it prints `*** SURPRISE ***` and hands off to a live
+   vision step to recover and finish.
+
+This is **demo-grade, not production-grade**: the divergence check is a pixel-difference
+heuristic. Real systems fingerprint by *element identity* (the accessibility tree / DOM),
+which is robust to layout shifts — and they re-anchor and resume the recording after a
+surprise instead of finishing in pure vision. The architecture is right; the robustness
+is where the engineering goes.
 
 ## Safety
 
