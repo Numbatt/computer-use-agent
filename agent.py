@@ -282,11 +282,18 @@ def run_vision(task: str, name: str, max_steps: int) -> None:
     b64, _, _ = mac.screenshot()
     messages = _seed_messages(task, b64)
     recorded: list[dict] = []
-    tally = _vision_loop(client, tool, beta, messages, max_steps, recorded)
-    _print_cost(tally)
-    print("[cost] (a --replay of this trajectory costs $0 unless it hits a surprise)")
-    _save_trajectory(name, task, recorded)
-    mac.notify("CUA loop done.")
+    try:
+        tally = _vision_loop(client, tool, beta, messages, max_steps, recorded)
+        _print_cost(tally)
+        print("[cost] (a --replay of this trajectory costs $0 unless it hits a surprise)")
+    except KeyboardInterrupt:
+        print("\n[interrupted] stopping; saving the partial trajectory so far...")
+    finally:
+        if recorded:
+            _save_trajectory(name, task, recorded)  # save even on interrupt/error
+        else:
+            print("[note] nothing recorded — no trajectory saved.")
+        mac.notify("CUA loop done.")
 
 
 def _human_continue(messages: list[dict]) -> bool:
