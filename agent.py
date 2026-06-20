@@ -331,8 +331,13 @@ def _pick_tool_and_beta(client, w: int, h: int) -> tuple[dict, str]:
     raise SystemExit(f"No computer-use tool/beta accepted by {MODEL}. Last error:\n{last_err}")
 
 
+def _slug(s: str) -> str:
+    """Make a filesystem-safe trajectory name (strip slashes, spaces, punctuation)."""
+    return re.sub(r"[^A-Za-z0-9_-]+", "_", s).strip("_-")[:60] or "task"
+
+
 def _save_trajectory(name: str, task: str, steps: list[dict]) -> None:
-    TRAJ_DIR.mkdir(exist_ok=True)
+    TRAJ_DIR.mkdir(parents=True, exist_ok=True)
     path = TRAJ_DIR / f"{name}.json"
     existed = path.exists()
     path.write_text(json.dumps({"task": task, "steps": steps}, indent=2))
@@ -480,10 +485,10 @@ def main() -> None:
         list_trajectories()
         return
     if args.forget:
-        forget_trajectory(args.forget)
+        forget_trajectory(args.forget if args.forget == "all" else _slug(args.forget))
         return
     if args.replay:
-        run_replay(args.replay, threshold=args.threshold)
+        run_replay(_slug(args.replay), threshold=args.threshold)
         return
     if args.dry_run:
         if not args.task:
@@ -493,7 +498,7 @@ def main() -> None:
     if not args.task:
         p.error("provide a task, or use --replay NAME")
 
-    name = args.name or re.sub(r"[^a-z0-9]+", "_", args.task.lower()).strip("_")[:40] or "task"
+    name = _slug(args.name) if args.name else _slug(args.task.lower())
     print("=" * 70)
     print("  Mac computer-use agent — VISION mode")
     print("  Move the mouse to a screen CORNER at any time to abort.")
